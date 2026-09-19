@@ -1,0 +1,129 @@
+# Test: @lam/vulture/tus-plugin — tus.io 1.0 resumable-upload protocol.
+#
+# Walks OPTIONS, POST, PATCH, HEAD, completion, conflict, and DELETE through
+# Server.inject with a temporary on-disk store.
+#
+# expect: options ver: 1.0.0
+# expect: options ext: creation,creation-with-upload,termination,concatenation,checksum
+# expect: create status: 201
+# expect: create location prefix: /uploads/
+# expect: id is uuid-len: 36
+# expect: patch1 status: 204
+# expect: patch1 offset: 6
+# expect: head status: 200
+# expect: head offset: 6
+# expect: head length: 11
+# expect: patch2 status: 204
+# expect: patch2 offset: 11
+# expect: conflict status: 409
+# expect: file: hello world
+# expect: delete status: 204
+# expect: file exists after: false
+# expect: ok
+
+from @lam/vulture import Server
+from @lam/vulture/tus-plugin import tusUploads
+from lamos import Os
+
+func main() {
+    tmp: str = Os.tempDir() + "/lam-vulture-tus-test"
+    Os.removeAll(tmp)
+
+    srv: Server = Server()
+    tusUploads(srv, "/uploads", tmp, 1024 * 1024)
+
+    opt: dict[str, any] = srv.inject("OPTIONS", "/uploads")
+    optHeaders: any = opt["headers"]
+    tusVersion: str = ""
+    tusExtensions: str = ""
+    go! {
+        if headers, ok := optHeaders.(map[string]string); ok {
+            tusVersion = headers["Tus-Version"]
+            tusExtensions = headers["Tus-Extension"]
+        }
+    }
+    print(f"options ver: {tusVersion}")
+    print(f"options ext: {tusExtensions}")
+
+    createHeaders: dict[str, str] = {}
+    createHeaders["Upload-Length"] = "11"
+    createHeaders["Upload-Metadata"] = "filename aGVsbG8udHh0"
+    createHeaders["Tus-Resumable"] = "1.0.0"
+    created: dict[str, any] = srv.inject("POST", "/uploads", "", createHeaders)
+    createStatus: any = created["status"]
+    responseHeaders: any = created["headers"]
+    location: str = ""
+    go! {
+        if headers, ok := responseHeaders.(map[string]string); ok {
+            location = headers["Location"]
+        }
+    }
+    print(f"create status: {createStatus}")
+    print(f"create location prefix: {location[:9]}")
+
+    id: str = location[9:]
+    print(f"id is uuid-len: {len(id)}")
+
+    firstHeaders: dict[str, str] = {}
+    firstHeaders["Tus-Resumable"] = "1.0.0"
+    firstHeaders["Content-Type"] = "application/offset+octet-stream"
+    firstHeaders["Upload-Offset"] = "0"
+    first: dict[str, any] = srv.inject("PATCH", location, "hello ", firstHeaders)
+    firstStatus: any = first["status"]
+    firstResponseHeaders: any = first["headers"]
+    firstOffset: str = ""
+    go! {
+        if headers, ok := firstResponseHeaders.(map[string]string); ok {
+            firstOffset = headers["Upload-Offset"]
+        }
+    }
+    print(f"patch1 status: {firstStatus}")
+    print(f"patch1 offset: {firstOffset}")
+
+    inspected: dict[str, any] = srv.inject("HEAD", location)
+    inspectStatus: any = inspected["status"]
+    inspectHeaders: any = inspected["headers"]
+    headOffset: str = ""
+    headLength: str = ""
+    go! {
+        if headers, ok := inspectHeaders.(map[string]string); ok {
+            headOffset = headers["Upload-Offset"]
+            headLength = headers["Upload-Length"]
+        }
+    }
+    print(f"head status: {inspectStatus}")
+    print(f"head offset: {headOffset}")
+    print(f"head length: {headLength}")
+
+    secondHeaders: dict[str, str] = {}
+    secondHeaders["Tus-Resumable"] = "1.0.0"
+    secondHeaders["Content-Type"] = "application/offset+octet-stream"
+    secondHeaders["Upload-Offset"] = "6"
+    second: dict[str, any] = srv.inject("PATCH", location, "world", secondHeaders)
+    secondStatus: any = second["status"]
+    secondResponseHeaders: any = second["headers"]
+    secondOffset: str = ""
+    go! {
+        if headers, ok := secondResponseHeaders.(map[string]string); ok {
+            secondOffset = headers["Upload-Offset"]
+        }
+    }
+    print(f"patch2 status: {secondStatus}")
+    print(f"patch2 offset: {secondOffset}")
+
+    conflictHeaders: dict[str, str] = {}
+    conflictHeaders["Tus-Resumable"] = "1.0.0"
+    conflictHeaders["Content-Type"] = "application/offset+octet-stream"
+    conflictHeaders["Upload-Offset"] = "999"
+    conflict: dict[str, any] = srv.inject("PATCH", location, "x", conflictHeaders)
+    print(f"conflict status: {conflict['status']}")
+
+    print(f"file: {Os.readFile(tmp + '/' + id)}")
+
+    deleted: dict[str, any] = srv.inject("DELETE", location)
+    print(f"delete status: {deleted['status']}")
+    print(f"file exists after: {Os.fileExists(tmp + '/' + id)}")
+
+    Os.removeAll(tmp)
+    print("ok")
+}

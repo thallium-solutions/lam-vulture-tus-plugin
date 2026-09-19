@@ -1,0 +1,11 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# tus 1.0 resumable uploads for @lam/vulture.
+# Import with: from @lam/vulture/tus-plugin import tusUploads, tusGc
+
+from .tus import tusUploads, tusGc
+
+func tag() -> str {
+    return "@lam/vulture/tus-plugin@1.0.0"
+}
