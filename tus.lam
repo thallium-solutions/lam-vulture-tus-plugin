@@ -8,7 +8,8 @@
 # Storage is a flat directory: every upload gets two files, ``<id>`` for the
 # raw bytes and ``<id>.json`` for durable protocol metadata.
 
-from @lam/vulture import Server, Request, Response
+from @lam/vulture import Server, Request, Response, RouteOptions
+from lamerrors import Result, Error
 
 go! {
     import (
@@ -35,8 +36,8 @@ go! {
     const lamTusExtensions = "creation,creation-with-upload,termination,concatenation,checksum"
     const lamTusChecksumAlgos = "sha1,sha256,md5"
 
-    // On-disk metadata. This and the filesystem helpers remain Go because the
-    // plugin durably streams binary data and updates offsets under a lock.
+    // On-disk metadata and filesystem primitives stay native because the
+    // plugin must preserve arbitrary bytes and serialize append/update pairs.
     type lamTusInfo struct {
         ID         string            `json:"id"`
         Length     int64             `json:"length"`
@@ -62,8 +63,6 @@ go! {
         }
     }
 
-    // Return (valid, supported). A missing checksum is valid because checksum
-    // is an optional protocol extension.
     func lamTusVerifyChecksum(header string, chunk []byte) (bool, bool) {
         header = strings.TrimSpace(header)
         if header == "" {
@@ -81,7 +80,7 @@ go! {
         if err != nil {
             return false, true
         }
-        h.Write(chunk)
+        _, _ = h.Write(chunk)
         got := h.Sum(nil)
         if len(got) != len(want) {
             return false, true
@@ -94,8 +93,6 @@ go! {
         return true, true
     }
 
-    // Per-upload locking protects offsets and append ordering under parallel
-    // PATCH requests. sync.Map avoids a global lock on unrelated uploads.
     var lamTusLocks sync.Map // map[string]*sync.Mutex
 
     func lamTusLockFor(id string) *sync.Mutex {
@@ -130,7 +127,6 @@ go! {
         return os.WriteFile(lamTusInfoPath(dir, info.ID), b, 0o644)
     }
 
-    // Parse Upload-Metadata's comma-separated "key base64(value)" pairs.
     func lamTusParseMetadata(raw string) map[string]string {
         out := map[string]string{}
         if raw == "" {
@@ -155,457 +151,529 @@ go! {
         return out
     }
 
-    func lamTusBaseHeaders(res *Response) {
-        res.Headers["Tus-Resumable"] = lamTusVersion
-        res.Headers["Cache-Control"] = "no-store"
+    func lamTusError(kind, message string) *LAMMERGEIER.Result {
+        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(kind, message, nil))
     }
 
-    func lamTusCorsHeaders(res *Response) {
-        res.Headers["Access-Control-Allow-Origin"] = "*"
-        res.Headers["Access-Control-Expose-Headers"] = "Upload-Offset, Location, Upload-Length, Tus-Resumable, Tus-Version, Tus-Max-Size, Tus-Extension, Tus-Checksum-Algorithm, Upload-Metadata, Upload-Concat"
-        res.Headers["Access-Control-Allow-Methods"] = "POST, HEAD, PATCH, OPTIONS, DELETE"
-        res.Headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Concat, Upload-Checksum, X-Requested-With"
+    func lamTusCompletionPayload(storeDir string, info *lamTusInfo) map[string]interface{} {
+        payload := map[string]interface{}{
+            "id":       info.ID,
+            "length":   info.Length,
+            "offset":   info.Offset,
+            "metadata": info.Metadata,
+            "path":     lamTusBlobPath(storeDir, info.ID),
+        }
+        if info.Concat != "" {
+            payload["concat"] = info.Concat
+        }
+        if len(info.Parts) > 0 {
+            payload["parts"] = info.Parts
+        }
+        return payload
+    }
+
+    func lamTusNotifyComplete(srv *Server, storeDir string, info *lamTusInfo) {
+        if cb, ok := srv.Ctx["__tusComplete"]; ok {
+            if fn, ok := cb.(func(map[string]interface{})); ok {
+                payload := lamTusCompletionPayload(storeDir, info)
+                func() {
+                    defer func() { _ = recover() }()
+                    fn(payload)
+                }()
+            }
+        }
     }
 }
 
-func tusUploads(srv: Server, mountPath: str, storeDir: str, maxBytes: int) {
-    #- Mount tus 1.0 endpoints at ``mountPath`` and store upload data under
-    ``storeDir``. ``maxBytes`` limits declared upload sizes
-    pass 0 for no
-    configured maximum.
+func _tusBaseHeaders(response: Response) {
+    response.setHeader("Tus-Resumable", "1.0.0")
+    response.setHeader("Cache-Control", "no-store")
+    response.setHeader("Access-Control-Allow-Origin", "*")
+    response.setHeader("Access-Control-Expose-Headers", "Upload-Offset, Location, Upload-Length, Tus-Resumable, Tus-Version, Tus-Max-Size, Tus-Extension, Tus-Checksum-Algorithm, Upload-Metadata, Upload-Concat")
+    response.setHeader("Access-Control-Allow-Methods", "POST, HEAD, PATCH, OPTIONS, DELETE")
+    response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Concat, Upload-Checksum, X-Requested-With")
+}
 
-    Registered routes:
+func _tusFail(response: Response, failure: any) {
+    status: int = 500
+    message: str = str(failure)
+    go! {
+        var kind string
+        switch e := failure.(type) {
+        case *LAMMERGEIER.Error:
+            kind = e.Kind
+            message = e.Message
+        case LAMMERGEIER.Error:
+            kind = e.Kind
+            message = e.Message
+        }
+        switch kind {
+        case "TusUploadNotFoundError":
+            status = 404
+        case "TusFinalUploadError":
+            status = 403
+        case "TusOffsetMismatchError":
+            status = 409
+        case "TusChecksumMismatchError":
+            status = 460
+        case "TusTooLargeError", "TusLengthExceededError":
+            status = 413
+        case "TusMediaTypeError":
+            status = 415
+        case "TusBadRequestError", "TusUnsupportedChecksumError":
+            status = 400
+        }
+    }
+    response.setStatus(status)
+    response.setHeader("Content-Type", "text/plain")
+    response.text("tus: " + message)
+}
 
-    * ``OPTIONS < mount > `` — protocol capabilities
-    * ``POST < mount > `` — create or concatenate an upload
-    * ``HEAD < mount > /: id`` — inspect upload offset and metadata
-    * ``PATCH < mount > /: id`` — append a binary chunk
-    * ``DELETE < mount > /: id`` — terminate and remove an upload
+func _tusChecksum(header: str, chunk: str) -> Result[bool] {
+    go! {
+        valid, supported := lamTusVerifyChecksum(header, []byte(chunk))
+        if !supported {
+            return lamTusError("TusUnsupportedChecksumError", "unsupported checksum algorithm")
+        }
+        if !valid {
+            return lamTusError("TusChecksumMismatchError", "checksum mismatch")
+        }
+        return LAMMERGEIER.Result.Ok(true)
+    }
+}
 
-    Set ``srv.ctx["__tusComplete"]`` to a callback that accepts the upload
-    info dict when an upload becomes complete. -  #
+func _tusCreate(storeDir: str, lengthHeader: str, metadataHeader: str, concatHeader: str, maxBytes: int) -> Result[str] {
+    go! {
+        length, err := strconv.ParseInt(lengthHeader, 10, 64)
+        if err != nil || length < 0 {
+            return lamTusError("TusBadRequestError", "invalid Upload-Length")
+        }
+        if maxBytes > 0 && length > int64(maxBytes) {
+            return lamTusError("TusTooLargeError", "upload exceeds Tus-Max-Size")
+        }
+
+        id := uuid.NewString()
+        info := &lamTusInfo{
+            ID:        id,
+            Length:    length,
+            Offset:    0,
+            Metadata:  lamTusParseMetadata(metadataHeader),
+            CreatedAt: time.Now().UTC(),
+        }
+        if concatHeader == "partial" {
+            info.Concat = "partial"
+        }
+        if err := lamTusWriteInfo(storeDir, info); err != nil {
+            return lamTusError("TusPersistenceError", "cannot persist info: "+err.Error())
+        }
+        f, err := os.Create(lamTusBlobPath(storeDir, id))
+        if err != nil {
+            _ = os.Remove(lamTusInfoPath(storeDir, id))
+            return lamTusError("TusPersistenceError", "cannot create blob: "+err.Error())
+        }
+        if err := f.Close(); err != nil {
+            _ = os.Remove(lamTusBlobPath(storeDir, id))
+            _ = os.Remove(lamTusInfoPath(storeDir, id))
+            return lamTusError("TusPersistenceError", "cannot close blob: "+err.Error())
+        }
+        return LAMMERGEIER.Result.Ok(id)
+    }
+}
+
+func _tusConcat(storeDir: str, concatHeader: str, metadataHeader: str, maxBytes: int, server: Server) -> Result[str] {
+    go! {
+        rest := strings.TrimSpace(strings.TrimPrefix(concatHeader, "final"))
+        rest = strings.TrimSpace(strings.TrimPrefix(rest, ";"))
+        if rest == "" {
+            return lamTusError("TusBadRequestError", "Upload-Concat final missing parts")
+        }
+
+        partURLs := strings.Fields(rest)
+        partIDs := make([]string, 0, len(partURLs))
+        var total int64
+        for _, u := range partURLs {
+            seg := u
+            if idx := strings.LastIndex(u, "/"); idx >= 0 {
+                seg = u[idx+1:]
+            }
+            part, err := lamTusReadInfo(storeDir, seg)
+            if err != nil {
+                return lamTusError("TusBadRequestError", fmt.Sprintf("unknown part %q", seg))
+            }
+            if part.Concat != "partial" {
+                return lamTusError("TusBadRequestError", fmt.Sprintf("part %q is not Upload-Concat: partial", seg))
+            }
+            if !part.Complete {
+                return lamTusError("TusBadRequestError", fmt.Sprintf("part %q is not complete", seg))
+            }
+            partIDs = append(partIDs, seg)
+            total += part.Length
+        }
+        if maxBytes > 0 && total > int64(maxBytes) {
+            return lamTusError("TusTooLargeError", "concatenated upload exceeds Tus-Max-Size")
+        }
+
+        id := uuid.NewString()
+        blobPath := lamTusBlobPath(storeDir, id)
+        out, err := os.Create(blobPath)
+        if err != nil {
+            return lamTusError("TusPersistenceError", "cannot create final blob: "+err.Error())
+        }
+        clean := func() {
+            _ = out.Close()
+            _ = os.Remove(blobPath)
+        }
+        for _, pid := range partIDs {
+            in, err := os.Open(lamTusBlobPath(storeDir, pid))
+            if err != nil {
+                clean()
+                return lamTusError("TusPersistenceError", "cannot read part blob: "+err.Error())
+            }
+            _, copyErr := io.Copy(out, in)
+            closeErr := in.Close()
+            if copyErr != nil {
+                clean()
+                return lamTusError("TusPersistenceError", "cannot copy part: "+copyErr.Error())
+            }
+            if closeErr != nil {
+                clean()
+                return lamTusError("TusPersistenceError", "cannot close part blob: "+closeErr.Error())
+            }
+        }
+        if err := out.Close(); err != nil {
+            _ = os.Remove(blobPath)
+            return lamTusError("TusPersistenceError", "cannot close final blob: "+err.Error())
+        }
+
+        now := time.Now().UTC()
+        info := &lamTusInfo{
+            ID:         id,
+            Length:     total,
+            Offset:     total,
+            Metadata:   lamTusParseMetadata(metadataHeader),
+            Complete:   true,
+            CreatedAt:  now,
+            FinishedAt: now,
+            Concat:     "final",
+            Parts:      partIDs,
+        }
+        if err := lamTusWriteInfo(storeDir, info); err != nil {
+            _ = os.Remove(blobPath)
+            return lamTusError("TusPersistenceError", "cannot persist final info: "+err.Error())
+        }
+        lamTusNotifyComplete(server, storeDir, info)
+        return LAMMERGEIER.Result.Ok(id)
+    }
+}
+
+func _tusPersistChunk(storeDir: str, id: str, offsetHeader: str, chunk: str, server: Server) -> Result[int] {
+    go! {
+        wantOffset, err := strconv.ParseInt(offsetHeader, 10, 64)
+        if err != nil || wantOffset < 0 {
+            return lamTusError("TusBadRequestError", "invalid Upload-Offset")
+        }
+
+        mu := lamTusLockFor(id)
+        mu.Lock()
+        defer mu.Unlock()
+
+        info, err := lamTusReadInfo(storeDir, id)
+        if err != nil {
+            if os.IsNotExist(err) {
+                return lamTusError("TusUploadNotFoundError", "upload not found")
+            }
+            return lamTusError("TusPersistenceError", "cannot read upload info: "+err.Error())
+        }
+        if info.Concat == "final" {
+            return lamTusError("TusFinalUploadError", "cannot PATCH a final upload")
+        }
+        if info.Offset != wantOffset {
+            return lamTusError("TusOffsetMismatchError", fmt.Sprintf("offset mismatch — got %d, want %d", wantOffset, info.Offset))
+        }
+
+        data := []byte(chunk)
+        if int64(len(data)) > info.Length-info.Offset {
+            return lamTusError("TusLengthExceededError", "chunk exceeds declared Upload-Length")
+        }
+        if len(data) == 0 {
+            return LAMMERGEIER.Result.Ok(int(info.Offset))
+        }
+
+        blobPath := lamTusBlobPath(storeDir, info.ID)
+        f, err := os.OpenFile(blobPath, os.O_WRONLY|os.O_APPEND, 0o644)
+        if err != nil {
+            return lamTusError("TusChunkPersistenceError", "cannot open upload blob: "+err.Error())
+        }
+        before, statErr := f.Stat()
+        if statErr != nil {
+            _ = f.Close()
+            return lamTusError("TusChunkPersistenceError", "cannot stat upload blob: "+statErr.Error())
+        }
+        n, writeErr := f.Write(data)
+        if writeErr == nil && n != len(data) {
+            writeErr = io.ErrShortWrite
+        }
+        closeErr := f.Close()
+        if writeErr != nil {
+            _ = os.Truncate(blobPath, before.Size())
+            return lamTusError("TusChunkPersistenceError", "cannot append upload chunk: "+writeErr.Error())
+        }
+        if closeErr != nil {
+            _ = os.Truncate(blobPath, before.Size())
+            return lamTusError("TusChunkPersistenceError", "cannot close upload blob: "+closeErr.Error())
+        }
+
+        info.Offset += int64(n)
+        becameComplete := !info.Complete && info.Offset == info.Length
+        if becameComplete {
+            info.Complete = true
+            info.FinishedAt = time.Now().UTC()
+        }
+        if err := lamTusWriteInfo(storeDir, info); err != nil {
+            rollbackErr := os.Truncate(blobPath, before.Size())
+            if rollbackErr != nil {
+                return lamTusError("TusChunkPersistenceError", "cannot persist offset: "+err.Error()+"; rollback failed: "+rollbackErr.Error())
+            }
+            return lamTusError("TusChunkPersistenceError", "cannot persist offset: "+err.Error())
+        }
+
+        if becameComplete {
+            lamTusNotifyComplete(server, storeDir, info)
+        }
+        return LAMMERGEIER.Result.Ok(int(info.Offset))
+    }
+}
+
+func _tusHeadHeaders(storeDir: str, id: str, mountPath: str) -> Result[dict[str, str]] {
+    go! {
+        info, err := lamTusReadInfo(storeDir, id)
+        if err != nil {
+            if os.IsNotExist(err) {
+                return lamTusError("TusUploadNotFoundError", "upload not found")
+            }
+            return lamTusError("TusPersistenceError", "cannot read upload info: "+err.Error())
+        }
+        headers := map[string]string{
+            "Upload-Length": strconv.FormatInt(info.Length, 10),
+            "Upload-Offset": strconv.FormatInt(info.Offset, 10),
+        }
+        if len(info.Metadata) > 0 {
+            pairs := []string{}
+            for k, v := range info.Metadata {
+                pairs = append(pairs, k+" "+base64.StdEncoding.EncodeToString([]byte(v)))
+            }
+            headers["Upload-Metadata"] = strings.Join(pairs, ",")
+        }
+        if info.Concat == "partial" {
+            headers["Upload-Concat"] = "partial"
+        } else if info.Concat == "final" {
+            urls := []string{}
+            for _, pid := range info.Parts {
+                urls = append(urls, mountPath+"/"+pid)
+            }
+            headers["Upload-Concat"] = "final;" + strings.Join(urls, " ")
+        }
+        return LAMMERGEIER.Result.Ok(headers)
+    }
+}
+
+func _tusDelete(storeDir: str, id: str) -> Result[bool] {
+    go! {
+        mu := lamTusLockFor(id)
+        mu.Lock()
+        defer mu.Unlock()
+
+        if err := os.Remove(lamTusBlobPath(storeDir, id)); err != nil && !os.IsNotExist(err) {
+            return lamTusError("TusPersistenceError", "cannot remove upload blob: "+err.Error())
+        }
+        if err := os.Remove(lamTusInfoPath(storeDir, id)); err != nil && !os.IsNotExist(err) {
+            return lamTusError("TusPersistenceError", "cannot remove upload info: "+err.Error())
+        }
+        lamTusLocks.Delete(id)
+        return LAMMERGEIER.Result.Ok(true)
+    }
+}
+
+func _tusOptions(_request: Request, response: Response, maxBytes: int) {
+    _tusBaseHeaders(response)
+    response.setHeader("Tus-Version", "1.0.0")
+    response.setHeader("Tus-Extension", "creation,creation-with-upload,termination,concatenation,checksum")
+    response.setHeader("Tus-Checksum-Algorithm", "sha1,sha256,md5")
+    if maxBytes > 0 {
+        response.setHeader("Tus-Max-Size", str(maxBytes))
+    }
+    response.setStatus(204)
+    response.sent = true
+}
+
+func _tusPost(request: Request, response: Response, server: Server, mountPath: str, storeDir: str, maxBytes: int) {
+    _tusBaseHeaders(response)
+    concatHeader: str = request.header("Upload-Concat").trim()
+    created: Result[str]
+    if concatHeader.startsWith("final") {
+        created = _tusConcat(storeDir, concatHeader, request.header("Upload-Metadata"), maxBytes, server)
+    } else {
+        created = _tusCreate(storeDir, request.header("Upload-Length"), request.header("Upload-Metadata"), concatHeader, maxBytes)
+    }
+    if not created.ok() {
+        _tusFail(response, created.error)
+        return
+    }
+
+    id: str = created.unwrap()
+    if not concatHeader.startsWith("final") and request.header("Content-Type").startsWith("application/offset+octet-stream") and len(request.body) > 0 {
+        checksum: Result[bool] = _tusChecksum(request.header("Upload-Checksum"), request.body)
+        if not checksum.ok() {
+            _tusFail(response, checksum.error)
+            return
+        }
+        persisted: Result[int] = _tusPersistChunk(storeDir, id, "0", request.body, server)
+        if not persisted.ok() {
+            _tusFail(response, persisted.error)
+            return
+        }
+        response.setHeader("Upload-Offset", str(persisted.unwrap()))
+    }
+
+    response.setHeader("Location", mountPath + "/" + id)
+    response.setStatus(201)
+    response.sent = true
+}
+
+func _tusHead(request: Request, response: Response, mountPath: str, storeDir: str) {
+    _tusBaseHeaders(response)
+    found: Result[dict[str, str]] = _tusHeadHeaders(storeDir, request.params[":id"], mountPath)
+    if not found.ok() {
+        _tusFail(response, found.error)
+        return
+    }
+    headers: dict[str, str] = found.unwrap()
+    response.setHeaders(headers)
+    response.setStatus(200)
+    response.sent = true
+}
+
+func _tusPatch(request: Request, response: Response, server: Server, storeDir: str) {
+    _tusBaseHeaders(response)
+    if not request.header("Content-Type").startsWith("application/offset+octet-stream") {
+        _tusFail(response, Error("TusMediaTypeError", "Content-Type must be application/offset+octet-stream", None))
+        return
+    }
+    checksum: Result[bool] = _tusChecksum(request.header("Upload-Checksum"), request.body)
+    if not checksum.ok() {
+        _tusFail(response, checksum.error)
+        return
+    }
+    persisted: Result[int] = _tusPersistChunk(storeDir, request.params[":id"], request.header("Upload-Offset"), request.body, server)
+    if not persisted.ok() {
+        _tusFail(response, persisted.error)
+        return
+    }
+    response.setHeader("Upload-Offset", str(persisted.unwrap()))
+    response.setStatus(204)
+    response.sent = true
+}
+
+func _tusDeleteHandler(request: Request, response: Response, storeDir: str) {
+    _tusBaseHeaders(response)
+    removed: Result[bool] = _tusDelete(storeDir, request.params[":id"])
+    if not removed.ok() {
+        _tusFail(response, removed.error)
+        return
+    }
+    response.setStatus(204)
+    response.sent = true
+}
+
+func tusUploads(server: Server, mountPath: str, storeDir: str, maxBytes: int) -> Result[bool] {
+    #- Mount tus 1.0 endpoints. Invalid configuration and store-directory
+    creation failures are returned as explicit ``Result.Err`` values. -#
+    if not mountPath.startsWith("/") or(len(mountPath) > 1 and mountPath.endsWith("/")) {
+        return Result.Err(Error("TusConfigurationError", "mountPath must be absolute and must not end with '/'", None))
+    }
+    if storeDir.trim() == "" {
+        return Result.Err(Error("TusConfigurationError", "storeDir must not be empty", None))
+    }
+    if maxBytes < 0 {
+        return Result.Err(Error("TusConfigurationError", "maxBytes must be zero or positive", None))
+    }
     go! {
         if err := os.MkdirAll(storeDir, 0o755); err != nil {
-            fmt.Fprintf(os.Stderr, "tus: cannot create store dir %s: %v\n", storeDir, err)
-            return
+            return lamTusError("TusConfigurationError", "cannot create store dir "+storeDir+": "+err.Error())
         }
     }
 
-    optionsHandler: any = None
-    postHandler: any = None
-    headHandler: any = None
-    patchHandler: any = None
-    deleteHandler: any = None
+    controlOptions: RouteOptions = RouteOptions()
+    controlOptions.tags = ["tus"]
+    uploadOptions: RouteOptions = RouteOptions(maxBytes)
+    uploadOptions.tags = ["tus"]
+    uploadOptions.consumes = ["application/offset+octet-stream"]
 
-    # Route handlers remain native Go callbacks because @lam/vulture's
-    # low-level handler contract is func(*Request, *Response), and because
-    # request bodies cross the generated binary boundary here.
+    optionsHandler: func(Request, Response) = lambda(request: Request, response: Response) -> None {
+        _tusOptions(request, response, maxBytes)
+    }
+    postHandler: func(Request, Response) = lambda(request: Request, response: Response) -> None {
+        _tusPost(request, response, server, mountPath, storeDir, maxBytes)
+    }
+    headHandler: func(Request, Response) = lambda(request: Request, response: Response) -> None {
+        _tusHead(request, response, mountPath, storeDir)
+    }
+    patchHandler: func(Request, Response) = lambda(request: Request, response: Response) -> None {
+        _tusPatch(request, response, server, storeDir)
+    }
+    deleteHandler: func(Request, Response) = lambda(request: Request, response: Response) -> None {
+        _tusDeleteHandler(request, response, storeDir)
+    }
+
+    server.options(mountPath, optionsHandler, controlOptions)
+    server.post(mountPath, postHandler, uploadOptions)
+    server.head(mountPath + "/:id", headHandler, controlOptions)
+    server.patch(mountPath + "/:id", patchHandler, uploadOptions)
+    server.del(mountPath + "/:id", deleteHandler, controlOptions)
+    return Result.Ok(true)
+}
+
+func tusGc(storeDir: str, maxAgeHours: int) -> Result[int] {
+    #- Delete upload pairs older than ``maxAgeHours``. Directory reads,
+    metadata decoding, and removals fail explicitly instead of returning a
+    partial/sentinel count. -#
+    if maxAgeHours < 0 {
+        return Result.Err(Error("TusConfigurationError", "maxAgeHours must be zero or positive", None))
+    }
     go! {
-        local := srv
-
-        optionsHandler = func(req *Request, res *Response) {
-            lamTusBaseHeaders(res)
-            lamTusCorsHeaders(res)
-            res.Headers["Tus-Version"] = lamTusVersions
-            res.Headers["Tus-Extension"] = lamTusExtensions
-            res.Headers["Tus-Checksum-Algorithm"] = lamTusChecksumAlgos
-            if maxBytes > 0 {
-                res.Headers["Tus-Max-Size"] = strconv.FormatInt(int64(maxBytes), 10)
-            }
-            res.Status = 204
-            res.Sent = true
+        entries, err := os.ReadDir(storeDir)
+        if err != nil {
+            return lamTusError("TusGcError", "cannot read store directory: "+err.Error())
         }
-
-        postHandler = func(req *Request, res *Response) {
-            lamTusBaseHeaders(res)
-            lamTusCorsHeaders(res)
-
-            concatHdr := strings.TrimSpace(req.Header("Upload-Concat"))
-
-            if strings.HasPrefix(concatHdr, "final") {
-                rest := strings.TrimSpace(strings.TrimPrefix(concatHdr, "final"))
-                rest = strings.TrimPrefix(rest, ";")
-                rest = strings.TrimSpace(rest)
-                if rest == "" {
-                    res.Status = 400
-                    res.Headers["Content-Type"] = "text/plain"
-                    res.Body = "tus: Upload-Concat final missing parts"
-                    res.Sent = true
-                    return
-                }
-                partURLs := strings.Fields(rest)
-                partIDs := make([]string, 0, len(partURLs))
-                var total int64
-                for _, u := range partURLs {
-                    seg := u
-                    if idx := strings.LastIndex(u, "/"); idx >= 0 {
-                        seg = u[idx+1:]
-                    }
-                    part, err := lamTusReadInfo(storeDir, seg)
-                    if err != nil {
-                        res.Status = 400
-                        res.Headers["Content-Type"] = "text/plain"
-                        res.Body = fmt.Sprintf("tus: unknown part %q", seg)
-                        res.Sent = true
-                        return
-                    }
-                    if part.Concat != "partial" {
-                        res.Status = 400
-                        res.Headers["Content-Type"] = "text/plain"
-                        res.Body = fmt.Sprintf("tus: part %q is not Upload-Concat: partial", seg)
-                        res.Sent = true
-                        return
-                    }
-                    if !part.Complete {
-                        res.Status = 400
-                        res.Headers["Content-Type"] = "text/plain"
-                        res.Body = fmt.Sprintf("tus: part %q is not complete", seg)
-                        res.Sent = true
-                        return
-                    }
-                    partIDs = append(partIDs, seg)
-                    total += part.Length
-                }
-                if maxBytes > 0 && total > int64(maxBytes) {
-                    res.Status = 413
-                    res.Headers["Content-Type"] = "text/plain"
-                    res.Body = "tus: concatenated upload exceeds Tus-Max-Size"
-                    res.Sent = true
-                    return
-                }
-
-                id := uuid.NewString()
-                out, err := os.Create(lamTusBlobPath(storeDir, id))
-                if err != nil {
-                    res.Status = 500
-                    res.Body = "tus: cannot create final blob: " + err.Error()
-                    res.Sent = true
-                    return
-                }
-                for _, pid := range partIDs {
-                    in, err := os.Open(lamTusBlobPath(storeDir, pid))
-                    if err != nil {
-                        out.Close()
-                        os.Remove(lamTusBlobPath(storeDir, id))
-                        res.Status = 500
-                        res.Body = "tus: cannot read part blob: " + err.Error()
-                        res.Sent = true
-                        return
-                    }
-                    _, err = io.Copy(out, in)
-                    in.Close()
-                    if err != nil {
-                        out.Close()
-                        os.Remove(lamTusBlobPath(storeDir, id))
-                        res.Status = 500
-                        res.Body = "tus: cannot copy part: " + err.Error()
-                        res.Sent = true
-                        return
-                    }
-                }
-                out.Close()
-
-                info := &lamTusInfo{
-                    ID:         id,
-                    Length:     total,
-                    Offset:     total,
-                    Metadata:   lamTusParseMetadata(req.Header("Upload-Metadata")),
-                    Complete:   true,
-                    CreatedAt:  time.Now().UTC(),
-                    FinishedAt: time.Now().UTC(),
-                    Concat:     "final",
-                    Parts:      partIDs,
-                }
-                _ = lamTusWriteInfo(storeDir, info)
-
-                if cb, ok := local.Ctx["__tusComplete"]; ok {
-                    if fn, ok := cb.(func(map[string]interface{})); ok {
-                        payload := map[string]interface{}{
-                            "id":       info.ID,
-                            "length":   info.Length,
-                            "offset":   info.Offset,
-                            "metadata": info.Metadata,
-                            "path":     lamTusBlobPath(storeDir, info.ID),
-                            "concat":   "final",
-                            "parts":    info.Parts,
-                        }
-                        func() {
-                            defer func() { _ = recover() }()
-                            fn(payload)
-                        }()
-                    }
-                }
-
-                res.Headers["Location"] = mountPath + "/" + id
-                res.Status = 201
-                res.Sent = true
-                return
+        cutoff := time.Now().Add(-time.Duration(maxAgeHours) * time.Hour)
+        removed := 0
+        for _, entry := range entries {
+            if !strings.HasSuffix(entry.Name(), ".json") {
+                continue
             }
-
-            lengthStr := req.Header("Upload-Length")
-            length, err := strconv.ParseInt(lengthStr, 10, 64)
-            if err != nil || length < 0 {
-                res.Status = 400
-                res.Headers["Content-Type"] = "text/plain"
-                res.Body = "tus: invalid Upload-Length"
-                res.Sent = true
-                return
-            }
-            if maxBytes > 0 && length > int64(maxBytes) {
-                res.Status = 413
-                res.Headers["Content-Type"] = "text/plain"
-                res.Body = "tus: upload exceeds Tus-Max-Size"
-                res.Sent = true
-                return
-            }
-
-            id := uuid.NewString()
-            info := &lamTusInfo{
-                ID:        id,
-                Length:    length,
-                Offset:    0,
-                Metadata:  lamTusParseMetadata(req.Header("Upload-Metadata")),
-                CreatedAt: time.Now().UTC(),
-            }
-            if concatHdr == "partial" {
-                info.Concat = "partial"
-            }
-            if err := lamTusWriteInfo(storeDir, info); err != nil {
-                res.Status = 500
-                res.Body = "tus: cannot persist info: " + err.Error()
-                res.Sent = true
-                return
-            }
-            f, err := os.Create(lamTusBlobPath(storeDir, id))
-            if err != nil {
-                res.Status = 500
-                res.Body = "tus: cannot create blob: " + err.Error()
-                res.Sent = true
-                return
-            }
-            f.Close()
-
-            ct := req.Header("Content-Type")
-            if strings.HasPrefix(ct, "application/offset+octet-stream") && len(req.Body) > 0 {
-                chunk := []byte(req.Body)
-                csum := req.Header("Upload-Checksum")
-                if csum != "" {
-                    valid, supported := lamTusVerifyChecksum(csum, chunk)
-                    if !supported {
-                        res.Status = 400
-                        res.Headers["Content-Type"] = "text/plain"
-                        res.Body = "tus: unsupported checksum algorithm"
-                        res.Sent = true
-                        return
-                    }
-                    if !valid {
-                        res.Status = 460
-                        res.Headers["Content-Type"] = "text/plain"
-                        res.Body = "tus: checksum mismatch"
-                        res.Sent = true
-                        return
-                    }
-                }
-                lamTusAppendChunk(storeDir, info, chunk, local)
-                res.Headers["Upload-Offset"] = strconv.FormatInt(info.Offset, 10)
-            }
-
-            res.Headers["Location"] = mountPath + "/" + id
-            res.Status = 201
-            res.Sent = true
-        }
-
-        headHandler = func(req *Request, res *Response) {
-            lamTusBaseHeaders(res)
-            lamTusCorsHeaders(res)
-            id := req.Params[":id"]
+            id := strings.TrimSuffix(entry.Name(), ".json")
             info, err := lamTusReadInfo(storeDir, id)
             if err != nil {
-                res.Status = 404
-                res.Sent = true
-                return
+                return lamTusError("TusGcError", "cannot read metadata for "+id+": "+err.Error())
             }
-            res.Headers["Upload-Length"] = strconv.FormatInt(info.Length, 10)
-            res.Headers["Upload-Offset"] = strconv.FormatInt(info.Offset, 10)
-            if len(info.Metadata) > 0 {
-                pairs := []string{}
-                for k, v := range info.Metadata {
-                    pairs = append(pairs, k+" "+base64.StdEncoding.EncodeToString([]byte(v)))
-                }
-                res.Headers["Upload-Metadata"] = strings.Join(pairs, ",")
-            }
-            if info.Concat == "partial" {
-                res.Headers["Upload-Concat"] = "partial"
-            } else if info.Concat == "final" {
-                urls := []string{}
-                for _, pid := range info.Parts {
-                    urls = append(urls, mountPath+"/"+pid)
-                }
-                res.Headers["Upload-Concat"] = "final;" + strings.Join(urls, " ")
-            }
-            res.Status = 200
-            res.Sent = true
-        }
-
-        patchHandler = func(req *Request, res *Response) {
-            lamTusBaseHeaders(res)
-            lamTusCorsHeaders(res)
-            id := req.Params[":id"]
-
-            ct := req.Header("Content-Type")
-            if !strings.HasPrefix(ct, "application/offset+octet-stream") {
-                res.Status = 415
-                res.Headers["Content-Type"] = "text/plain"
-                res.Body = "tus: Content-Type must be application/offset+octet-stream"
-                res.Sent = true
-                return
-            }
-            wantOffset, err := strconv.ParseInt(req.Header("Upload-Offset"), 10, 64)
-            if err != nil {
-                res.Status = 400
-                res.Body = "tus: invalid Upload-Offset"
-                res.Sent = true
-                return
+            if !info.CreatedAt.Before(cutoff) {
+                continue
             }
 
             mu := lamTusLockFor(id)
             mu.Lock()
-            defer mu.Unlock()
-
-            info, err := lamTusReadInfo(storeDir, id)
-            if err != nil {
-                res.Status = 404
-                res.Sent = true
-                return
+            if err := os.Remove(lamTusBlobPath(storeDir, id)); err != nil && !os.IsNotExist(err) {
+                mu.Unlock()
+                return lamTusError("TusGcError", "cannot remove blob for "+id+": "+err.Error())
             }
-            if info.Concat == "final" {
-                res.Status = 403
-                res.Headers["Content-Type"] = "text/plain"
-                res.Body = "tus: cannot PATCH a final upload"
-                res.Sent = true
-                return
+            if err := os.Remove(lamTusInfoPath(storeDir, id)); err != nil {
+                mu.Unlock()
+                return lamTusError("TusGcError", "cannot remove metadata for "+id+": "+err.Error())
             }
-            if info.Offset != wantOffset {
-                res.Status = 409
-                res.Headers["Content-Type"] = "text/plain"
-                res.Body = fmt.Sprintf("tus: offset mismatch — got %d, want %d", wantOffset, info.Offset)
-                res.Sent = true
-                return
-            }
-
-            chunk := []byte(req.Body)
-            csum := req.Header("Upload-Checksum")
-            if csum != "" {
-                valid, supported := lamTusVerifyChecksum(csum, chunk)
-                if !supported {
-                    res.Status = 400
-                    res.Headers["Content-Type"] = "text/plain"
-                    res.Body = "tus: unsupported checksum algorithm"
-                    res.Sent = true
-                    return
-                }
-                if !valid {
-                    res.Status = 460
-                    res.Headers["Content-Type"] = "text/plain"
-                    res.Body = "tus: checksum mismatch"
-                    res.Sent = true
-                    return
-                }
-            }
-
-            lamTusAppendChunk(storeDir, info, chunk, local)
-
-            res.Headers["Upload-Offset"] = strconv.FormatInt(info.Offset, 10)
-            res.Status = 204
-            res.Sent = true
-        }
-
-        deleteHandler = func(req *Request, res *Response) {
-            lamTusBaseHeaders(res)
-            lamTusCorsHeaders(res)
-            id := req.Params[":id"]
-            os.Remove(lamTusBlobPath(storeDir, id))
-            os.Remove(lamTusInfoPath(storeDir, id))
+            mu.Unlock()
             lamTusLocks.Delete(id)
-            res.Status = 204
-            res.Sent = true
+            removed++
         }
-    }
-
-    srv.route("OPTIONS", mountPath, optionsHandler, None, "json")
-    srv.route("POST", mountPath, postHandler, None, "json")
-    srv.route("HEAD", mountPath + "/:id", headHandler, None, "json")
-    srv.route("PATCH", mountPath + "/:id", patchHandler, None, "json")
-    srv.route("DELETE", mountPath + "/:id", deleteHandler, None, "json")
-}
-
-func tusGc(storeDir: str, maxAgeHours: int) -> int {
-    #- Delete upload pairs whose metadata creation time is older than
-    ``maxAgeHours``. Returns the number of pairs removed. -  #
-    n: int = 0
-    go! {
-        cutoff := time.Now().Add(-time.Duration(maxAgeHours) * time.Hour)
-        if entries, err := os.ReadDir(storeDir); err == nil {
-            for _, e := range entries {
-                if !strings.HasSuffix(e.Name(), ".json") {
-                    continue
-                }
-                id := strings.TrimSuffix(e.Name(), ".json")
-                info, err := lamTusReadInfo(storeDir, id)
-                if err != nil {
-                    continue
-                }
-                if info.CreatedAt.Before(cutoff) {
-                    os.Remove(lamTusBlobPath(storeDir, id))
-                    os.Remove(lamTusInfoPath(storeDir, id))
-                    lamTusLocks.Delete(id)
-                    n++
-                }
-            }
-        }
-    }
-    return n
-}
-
-go! {
-    // Shared filesystem write path for creation-with-upload and PATCH. Keeping
-    // this native preserves binary bytes, append semantics, and callback ABI.
-    func lamTusAppendChunk(storeDir string, info *lamTusInfo, chunk []byte, srv *Server) {
-        if len(chunk) == 0 {
-            return
-        }
-        f, err := os.OpenFile(lamTusBlobPath(storeDir, info.ID), os.O_WRONLY|os.O_APPEND, 0o644)
-        if err != nil {
-            return
-        }
-        defer f.Close()
-        n, err := f.Write(chunk)
-        if err != nil {
-            return
-        }
-        info.Offset += int64(n)
-        if info.Offset >= info.Length {
-            info.Complete = true
-            info.FinishedAt = time.Now().UTC()
-        }
-        _ = lamTusWriteInfo(storeDir, info)
-
-        if info.Complete {
-            if cb, ok := srv.Ctx["__tusComplete"]; ok {
-                if fn, ok := cb.(func(map[string]interface{})); ok {
-                    payload := map[string]interface{}{
-                        "id":       info.ID,
-                        "length":   info.Length,
-                        "offset":   info.Offset,
-                        "metadata": info.Metadata,
-                        "path":     lamTusBlobPath(storeDir, info.ID),
-                    }
-                    func() {
-                        defer func() { _ = recover() }()
-                        fn(payload)
-                    }()
-                }
-            }
-        }
+        return LAMMERGEIER.Result.Ok(removed)
     }
 }

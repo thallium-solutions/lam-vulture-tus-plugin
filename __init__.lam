@@ -7,5 +7,5 @@
 from .tus import tusUploads, tusGc
 
 func tag() -> str {
-    return "@lam/vulture/tus-plugin@1.0.0"
+    return "@lam/vulture/tus-plugin@2.0.0"
 }

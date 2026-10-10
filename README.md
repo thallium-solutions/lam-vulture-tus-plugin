@@ -31,27 +31,27 @@ Tus-Checksum-Algorithm: sha1,sha256,md5
 
 ## Requirements
 
-- Lammergeier compiler (`lamc`) 1.17.0 or newer in the compatible `1.x` line
-  (`^1.17`).
-- `@lam/vulture` v1.0.0. The release Git ref is pinned in `lamlib.toml`.
+- Lammergeier compiler (`lamc`) 1.18.0 or newer in the compatible `1.x` line
+  (`^1.18`).
+- `@lam/vulture` v2.0.0. The release Git ref is pinned in `lamlib.toml`.
 - `github.com/google/uuid` v1.6.0. This matches the version used by the former
   central standard-library module.
 
 ## Installation
 
-Install the v1.0.0 Git release directly:
+Install the v2.0.0 Git release directly:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-vulture-tus-plugin.git@v1.0.0
+lamc install https://github.com/thallium-solutions/lam-vulture-tus-plugin.git@v2.0.0
 ```
 
 After registry publication, install by scoped package name:
 
 ```bash
-lamc install @lam/vulture/tus-plugin@1.0.0
+lamc install @lam/vulture/tus-plugin@2.0.0
 ```
 
-The package manifest resolves `@lam/vulture` from its pinned v1.0.0 Git ref.
+The package manifest resolves `@lam/vulture` from its pinned v2.0.0 Git ref.
 Applications import the plugin and the core server separately:
 
 ```lammergeier
@@ -83,9 +83,9 @@ func main() {
 
     # Mount routes below /uploads, store data under ./var/uploads, and reject
     # declared upload lengths above 200 MiB.
-    tusUploads(server, "/uploads", "./var/uploads", 200 * 1024 * 1024)
+    _ = tusUploads(server, "/uploads", "./var/uploads", 200 * 1024 * 1024).unwrap()
 
-    server.listen(8080)
+    _ = server.listen(8080).unwrap()
 }
 ```
 
@@ -109,7 +109,7 @@ upload.start();
 ### `tusUploads`
 
 ```lammergeier
-func tusUploads(server: Server, mountPath: str, storeDir: str, maxBytes: int)
+func tusUploads(server: Server, mountPath: str, storeDir: str, maxBytes: int) -> Result[bool]
 ```
 
 Registers these routes:
@@ -122,25 +122,34 @@ Registers these routes:
 | `PATCH` | `<mount>/:id` | Validate and append the next chunk |
 | `DELETE` | `<mount>/:id` | Remove the blob and metadata pair |
 
-`mountPath` should be an absolute URL path without a trailing slash. `storeDir`
+`mountPath` must be an absolute URL path without a trailing slash. `storeDir`
 is created with mode `0755` if it does not exist. `maxBytes` is compared against
 the declared `Upload-Length` and the total final-concatenation length; use `0`
-for no plugin-level maximum.
+for no plugin-level maximum. Invalid configuration and directory-creation
+failures return `Result.Err(TusConfigurationError)`; route registration succeeds
+with `Result.Ok(true)`. This unsuffixed Result API replaces v1's stderr message
+and silent early return.
+
+The plugin registers typed handlers through `@lam/vulture` v2's verb overloads
+and `RouteOptions`. POST and PATCH use `maxBytes` as their route body limit in
+addition to tus's declared-length checks.
 
 ### `tusGc`
 
 ```lammergeier
-func tusGc(storeDir: str, maxAgeHours: int) -> int
+func tusGc(storeDir: str, maxAgeHours: int) -> Result[int]
 ```
 
 Deletes blob/metadata pairs whose metadata creation time is older than the
-configured age and returns the number removed. The plugin does not run a
-background expiry task.
+configured age and returns the number removed through `Result.Ok`. Directory
+reads, malformed metadata, and removal failures return `Result.Err(TusGcError)`
+instead of being skipped or collapsed into a partial count. The plugin does not
+run a background expiry task.
 
 ```lammergeier
 from @lam/vulture/tus-plugin import tusGc
 
-removed: int = tusGc("./var/uploads", 72)
+removed: int = tusGc("./var/uploads", 72).unwrap()
 print(f"removed {removed} uploads older than three days")
 ```
 
@@ -149,7 +158,7 @@ print(f"removed {removed} uploads older than three days")
 ```lammergeier
 from @lam/vulture/tus-plugin import tag
 
-print(tag())  # @lam/vulture/tus-plugin@1.0.0
+print(tag())  # @lam/vulture/tus-plugin@2.0.0
 ```
 
 ## Configuration examples
@@ -157,7 +166,7 @@ print(tag())  # @lam/vulture/tus-plugin@1.0.0
 ### Unlimited development endpoint
 
 ```lammergeier
-tusUploads(server, "/uploads", "./tmp/uploads", 0)
+_ = tusUploads(server, "/uploads", "./tmp/uploads", 0).unwrap()
 ```
 
 An unlimited endpoint is convenient for local development but is generally
@@ -167,8 +176,8 @@ production and also configure request-body limits at the reverse proxy.
 ### Separate stores and limits
 
 ```lammergeier
-tusUploads(server, "/avatars", "./var/uploads/avatars", 10 * 1024 * 1024)
-tusUploads(server, "/videos", "./var/uploads/videos", 2 * 1024 * 1024 * 1024)
+_ = tusUploads(server, "/avatars", "./var/uploads/avatars", 10 * 1024 * 1024).unwrap()
+_ = tusUploads(server, "/videos", "./var/uploads/videos", 2 * 1024 * 1024 * 1024).unwrap()
 ```
 
 Use distinct directories when different upload classes have different
@@ -185,7 +194,7 @@ from @lam/vulture/tus-plugin import tusUploads
 
 server: Server = Server()
 server.ctx["__tusComplete"] = lambda upload: print(f"ready: {upload['path']}")
-tusUploads(server, "/uploads", "./var/uploads", 200 * 1024 * 1024)
+_ = tusUploads(server, "/uploads", "./var/uploads", 200 * 1024 * 1024).unwrap()
 ```
 
 Completion callbacks run after metadata is marked complete. Keep callbacks
@@ -212,8 +221,8 @@ func requireUploadToken(request: Request, response: Response) {
 
 server: Server = Server()
 server.onRequest(requireUploadToken)
-tusUploads(server, "/uploads", "/srv/myapp/uploads", 200 * 1024 * 1024)
-server.listen(8080)
+_ = tusUploads(server, "/uploads", "/srv/myapp/uploads", 200 * 1024 * 1024).unwrap()
+_ = server.listen(8080).unwrap()
 ```
 
 Replace the literal token with your normal identity and policy layer. In
@@ -259,8 +268,11 @@ Example metadata:
 }
 ```
 
-Writes append to the blob first and persist the new offset afterward. A
-per-upload mutex serializes concurrent patches in one server process. The flat
+Writes append to the blob first and persist the new offset afterward. Open,
+write, close, and metadata failures are represented internally as typed Results
+and become explicit `500` responses; metadata-write failures attempt to truncate
+the blob back to its previous size. A per-upload mutex serializes concurrent
+patches in one server process. The flat
 filesystem backend is deliberately simple: it does not provide shared locks
 between multiple processes, distributed/object storage, encryption at rest,
 free-space quotas, or automatic retention.

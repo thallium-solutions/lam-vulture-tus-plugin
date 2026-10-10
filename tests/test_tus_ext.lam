@@ -15,7 +15,7 @@
 # expect: final-concat-header-prefix: final;
 # expect: patch-final-forbidden: 403
 
-from @lam/vulture import Server
+from @lam/vulture import Server, InjectResponse
 from @lam/vulture/tus-plugin import tusUploads
 from lamos import Os
 
@@ -28,35 +28,20 @@ go! {
 
 func main() {
     tmp: str = Os.tempDir() + "/lam-vulture-tus-ext"
-    Os.removeAll(tmp)
+    _ = Os.removeAll(tmp)
 
-    srv: Server = Server()
-    tusUploads(srv, "/u", tmp, 1024 * 1024)
+    server: Server = Server()
+    _ = tusUploads(server, "/u", tmp, 1024 * 1024).unwrap()
 
-    opt: dict[str, any] = srv.inject("OPTIONS", "/u")
-    optHeaders: any = opt["headers"]
-    algorithm: str = ""
-    extensions: str = ""
-    go! {
-        if headers, ok := optHeaders.(map[string]string); ok {
-            algorithm = headers["Tus-Checksum-Algorithm"]
-            extensions = headers["Tus-Extension"]
-        }
-    }
-    print(f"opt-algo: {algorithm}")
-    print(f"opt-ext: {extensions}")
+    options: InjectResponse = server.inject("OPTIONS", "/u")
+    print(f"opt-algo: {options.header('Tus-Checksum-Algorithm')}")
+    print(f"opt-ext: {options.header('Tus-Extension')}")
 
     checksumCreateHeaders: dict[str, str] = {}
     checksumCreateHeaders["Upload-Length"] = "5"
     checksumCreateHeaders["Tus-Resumable"] = "1.0.0"
-    checksumUpload: dict[str, any] = srv.inject("POST", "/u", "", checksumCreateHeaders)
-    checksumUploadHeaders: any = checksumUpload["headers"]
-    checksumLocation: str = ""
-    go! {
-        if headers, ok := checksumUploadHeaders.(map[string]string); ok {
-            checksumLocation = headers["Location"]
-        }
-    }
+    checksumUpload: InjectResponse = server.inject("POST", "/u", "", checksumCreateHeaders)
+    checksumLocation: str = checksumUpload.header("Location")
 
     goodChecksum: str = ""
     go! {
@@ -69,114 +54,73 @@ func main() {
     goodHeaders["Content-Type"] = "application/offset+octet-stream"
     goodHeaders["Upload-Offset"] = "0"
     goodHeaders["Upload-Checksum"] = goodChecksum
-    good: dict[str, any] = srv.inject("PATCH", checksumLocation, "hello", goodHeaders)
-    print(f"checksum-good: {good['status']}")
+    good: InjectResponse = server.inject("PATCH", checksumLocation, "hello", goodHeaders)
+    print(f"checksum-good: {good.status}")
 
-    mismatchUpload: dict[str, any] = srv.inject("POST", "/u", "", checksumCreateHeaders)
-    mismatchUploadHeaders: any = mismatchUpload["headers"]
-    mismatchLocation: str = ""
-    go! {
-        if headers, ok := mismatchUploadHeaders.(map[string]string); ok {
-            mismatchLocation = headers["Location"]
-        }
-    }
+    mismatchUpload: InjectResponse = server.inject("POST", "/u", "", checksumCreateHeaders)
+    mismatchLocation: str = mismatchUpload.header("Location")
 
     mismatchHeaders: dict[str, str] = {}
     mismatchHeaders["Tus-Resumable"] = "1.0.0"
     mismatchHeaders["Content-Type"] = "application/offset+octet-stream"
     mismatchHeaders["Upload-Offset"] = "0"
     mismatchHeaders["Upload-Checksum"] = "sha1 YWFhYWFhYWFhYWFhYWFhYWFhYWE="
-    mismatch: dict[str, any] = srv.inject("PATCH", mismatchLocation, "hello", mismatchHeaders)
-    print(f"checksum-bad: {mismatch['status']}")
+    mismatch: InjectResponse = server.inject("PATCH", mismatchLocation, "hello", mismatchHeaders)
+    print(f"checksum-bad: {mismatch.status}")
 
     unsupportedHeaders: dict[str, str] = {}
     unsupportedHeaders["Tus-Resumable"] = "1.0.0"
     unsupportedHeaders["Content-Type"] = "application/offset+octet-stream"
     unsupportedHeaders["Upload-Offset"] = "0"
     unsupportedHeaders["Upload-Checksum"] = "whirlpool ZmFrZQ=="
-    unsupported: dict[str, any] = srv.inject("PATCH", mismatchLocation, "hello", unsupportedHeaders)
-    print(f"checksum-bad-algo: {unsupported['status']}")
+    unsupported: InjectResponse = server.inject("PATCH", mismatchLocation, "hello", unsupportedHeaders)
+    print(f"checksum-bad-algo: {unsupported.status}")
 
     partAHeaders: dict[str, str] = {}
     partAHeaders["Upload-Length"] = "6"
     partAHeaders["Tus-Resumable"] = "1.0.0"
     partAHeaders["Upload-Concat"] = "partial"
-    partA: dict[str, any] = srv.inject("POST", "/u", "", partAHeaders)
-    partAResponseHeaders: any = partA["headers"]
-    partALocation: str = ""
-    go! {
-        if headers, ok := partAResponseHeaders.(map[string]string); ok {
-            partALocation = headers["Location"]
-        }
-    }
+    partA: InjectResponse = server.inject("POST", "/u", "", partAHeaders)
+    partALocation: str = partA.header("Location")
 
     partBHeaders: dict[str, str] = {}
     partBHeaders["Upload-Length"] = "5"
     partBHeaders["Tus-Resumable"] = "1.0.0"
     partBHeaders["Upload-Concat"] = "partial"
-    partB: dict[str, any] = srv.inject("POST", "/u", "", partBHeaders)
-    partBResponseHeaders: any = partB["headers"]
-    partBLocation: str = ""
-    go! {
-        if headers, ok := partBResponseHeaders.(map[string]string); ok {
-            partBLocation = headers["Location"]
-        }
-    }
+    partB: InjectResponse = server.inject("POST", "/u", "", partBHeaders)
+    partBLocation: str = partB.header("Location")
 
     uploadAHeaders: dict[str, str] = {}
     uploadAHeaders["Tus-Resumable"] = "1.0.0"
     uploadAHeaders["Content-Type"] = "application/offset+octet-stream"
     uploadAHeaders["Upload-Offset"] = "0"
-    uploadedA: dict[str, any] = srv.inject("PATCH", partALocation, "hello ", uploadAHeaders)
-    print(f"part-a-patch: {uploadedA['status']}")
+    uploadedA: InjectResponse = server.inject("PATCH", partALocation, "hello ", uploadAHeaders)
+    print(f"part-a-patch: {uploadedA.status}")
 
     uploadBHeaders: dict[str, str] = {}
     uploadBHeaders["Tus-Resumable"] = "1.0.0"
     uploadBHeaders["Content-Type"] = "application/offset+octet-stream"
     uploadBHeaders["Upload-Offset"] = "0"
-    uploadedB: dict[str, any] = srv.inject("PATCH", partBLocation, "world", uploadBHeaders)
-    print(f"part-b-patch: {uploadedB['status']}")
+    uploadedB: InjectResponse = server.inject("PATCH", partBLocation, "world", uploadBHeaders)
+    print(f"part-b-patch: {uploadedB.status}")
 
-    inspectedPart: dict[str, any] = srv.inject("HEAD", partALocation)
-    inspectedPartHeaders: any = inspectedPart["headers"]
-    partialConcat: str = ""
-    go! {
-        if headers, ok := inspectedPartHeaders.(map[string]string); ok {
-            partialConcat = headers["Upload-Concat"]
-        }
-    }
-    print(f"head-partial-concat: {partialConcat}")
+    inspectedPart: InjectResponse = server.inject("HEAD", partALocation)
+    print(f"head-partial-concat: {inspectedPart.header('Upload-Concat')}")
 
     finalHeaders: dict[str, str] = {}
     finalHeaders["Tus-Resumable"] = "1.0.0"
     finalHeaders["Upload-Concat"] = f"final;{partALocation} {partBLocation}"
-    finalUpload: dict[str, any] = srv.inject("POST", "/u", "", finalHeaders)
-    finalStatus: any = finalUpload["status"]
-    finalResponseHeaders: any = finalUpload["headers"]
-    finalLocation: str = ""
-    go! {
-        if headers, ok := finalResponseHeaders.(map[string]string); ok {
-            finalLocation = headers["Location"]
-        }
-    }
-    print(f"final-status: {finalStatus}")
+    finalUpload: InjectResponse = server.inject("POST", "/u", "", finalHeaders)
+    finalLocation: str = finalUpload.header("Location")
+    print(f"final-status: {finalUpload.status}")
 
-    inspectedFinal: dict[str, any] = srv.inject("HEAD", finalLocation)
-    inspectedFinalStatus: any = inspectedFinal["status"]
-    inspectedFinalHeaders: any = inspectedFinal["headers"]
-    finalLength: str = ""
-    finalConcat: str = ""
-    go! {
-        if headers, ok := inspectedFinalHeaders.(map[string]string); ok {
-            finalLength = headers["Upload-Length"]
-            finalConcat = headers["Upload-Concat"]
-        }
-    }
-    print(f"final-length-11: {finalLength == '11'}")
-    print(f"final-complete: {inspectedFinalStatus}")
+    inspectedFinal: InjectResponse = server.inject("HEAD", finalLocation)
+    finalConcat: str = inspectedFinal.header("Upload-Concat")
+    print(f"final-length-11: {inspectedFinal.header('Upload-Length') == '11'}")
+    print(f"final-complete: {inspectedFinal.status}")
 
     finalId: str = finalLocation[3:]
-    print(f"final-content: {Os.readFile(tmp + '/' + finalId)}")
+    print(f"final-content: {Os.readFile(tmp + '/' + finalId).unwrap()}")
 
     marker: str = ""
     if finalConcat.startsWith("final;") {
@@ -188,8 +132,8 @@ func main() {
     finalPatchHeaders["Tus-Resumable"] = "1.0.0"
     finalPatchHeaders["Content-Type"] = "application/offset+octet-stream"
     finalPatchHeaders["Upload-Offset"] = "11"
-    finalPatch: dict[str, any] = srv.inject("PATCH", finalLocation, "x", finalPatchHeaders)
-    print(f"patch-final-forbidden: {finalPatch['status']}")
+    finalPatch: InjectResponse = server.inject("PATCH", finalLocation, "x", finalPatchHeaders)
+    print(f"patch-final-forbidden: {finalPatch.status}")
 
-    Os.removeAll(tmp)
+    _ = Os.removeAll(tmp)
 }

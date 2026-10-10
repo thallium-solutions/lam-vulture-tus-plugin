@@ -15,7 +15,7 @@ from pathlib import Path
 LIB_ROOT = Path(__file__).resolve().parents[1]
 CORE_LIB_ROOT = LIB_ROOT.parent / "lam-vulture"
 COMPILER = "lamc"
-MIN_COMPILER_VERSION = (1, 17, 0)
+MIN_COMPILER_VERSION = (1, 18, 0)
 PACKAGE_PATH = Path("@lam") / "vulture" / "tus-plugin"
 CORE_PACKAGE_PATH = Path("@lam") / "vulture"
 VERSION_PATTERN = re.compile(r"(?:lamc\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?")

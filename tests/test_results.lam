@@ -1,0 +1,44 @@
+# Test: v2 typed Result failures for setup, GC, and chunk persistence.
+#
+# expect: invalid-config-error: true
+# expect: missing-gc-error: true
+# expect: corrupt-gc-error: true
+# expect: missing-blob-patch: 500
+# expect: gc-removed: 1
+
+from @lam/vulture import Server, InjectResponse
+from @lam/vulture/tus-plugin import tusUploads, tusGc
+from lamos import Os
+
+func main() {
+    tmp: str = Os.tempDir() + "/lam-vulture-tus-results"
+    _ = Os.removeAll(tmp)
+
+    invalidServer: Server = Server()
+    print(f"invalid-config-error: {not tusUploads(invalidServer, 'relative', tmp, 10).ok()}")
+    print(f"missing-gc-error: {not tusGc(tmp + '/missing', 1).ok()}")
+
+    _ = Os.mkdir(tmp).unwrap()
+    _ = Os.writeFile(tmp + "/corrupt.json", "not-json").unwrap()
+    print(f"corrupt-gc-error: {not tusGc(tmp, 1).ok()}")
+    _ = Os.remove(tmp + "/corrupt.json").unwrap()
+
+    server: Server = Server()
+    _ = tusUploads(server, "/uploads", tmp, 1024).unwrap()
+    createHeaders: dict[str, str] = {"Upload-Length": "5"}
+    created: InjectResponse = server.inject("POST", "/uploads", "", createHeaders)
+    location: str = created.header("Location")
+    id: str = location[9:]
+    _ = Os.remove(tmp + "/" + id).unwrap()
+
+    patchHeaders: dict[str, str] = {
+        "Content-Type": "application/offset+octet-stream",
+        "Upload-Offset": "0",
+    }
+    patched: InjectResponse = server.inject("PATCH", location, "hello", patchHeaders)
+    print(f"missing-blob-patch: {patched.status}")
+    removed: int = tusGc(tmp, 0).unwrap()
+    print(f"gc-removed: {removed}")
+
+    _ = Os.removeAll(tmp)
+}

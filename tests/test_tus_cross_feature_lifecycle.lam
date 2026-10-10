@@ -1,0 +1,137 @@
+# Complex tus lifecycle over an ephemeral local Vulture listener, including
+# setup/GC Results and empty, successful, and conflicting chunks.
+# expect: bad mount result: true
+# expect: bad store result: true
+# expect: bad max result: true
+# expect: missing gc result: true
+# expect: setup result: true
+# expect: listen result: true
+# expect: options status: 204
+# expect: options version: 1.0.0
+# expect: options max: 64
+# expect: create status: 201
+# expect: location valid: true
+# expect: bad media status: 415
+# expect: empty chunk status: 204
+# expect: empty chunk offset: 0
+# expect: first chunk status: 204
+# expect: first chunk offset: 2
+# expect: conflict status: 409
+# expect: final chunk status: 204
+# expect: final chunk offset: 5
+# expect: head status: 200
+# expect: head length: 5
+# expect: head offset: 5
+# expect: stored content: hello
+# expect: gc result: true
+# expect: gc removed: 1
+# expect: blob removed: true
+# expect: head after gc: 404
+
+from @lam/vulture import Server
+from @lam/vulture/tus-plugin import tusUploads, tusGc
+from lamerrors import Result
+from lamhttp import HttpClient, HttpResponse
+from lamos import Os
+
+
+func resultBool(result: Result[bool]) -> bool {
+    go! {
+        return result.Value.(bool)
+    }
+}
+
+func main() {
+    tmp: str = Os.tempDir() + "/lam-vulture-tus-cross-feature"
+    _ = Os.removeAll(tmp)
+
+    badMountServer: Server = Server()
+    print("bad mount result: " + str(not tusUploads(badMountServer, "relative", tmp, 64).ok()))
+    badStoreServer: Server = Server()
+    print("bad store result: " + str(not tusUploads(badStoreServer, "/u", "", 64).ok()))
+    badMaxServer: Server = Server()
+    print("bad max result: " + str(not tusUploads(badMaxServer, "/u", tmp, -1).ok()))
+    print("missing gc result: " + str(not tusGc(tmp + "/missing", 1).ok()))
+
+    server: Server = Server()
+    setup: Result[bool] = tusUploads(server, "/uploads", tmp, 64)
+    print("setup result: " + str(setup.ok()))
+    listening: Result[bool] = server.listenBackground(0)
+    print("listen result: " + str(listening.ok()))
+
+    client: HttpClient = HttpClient("http://" + server.boundAddr, 1000)
+    options: HttpResponse = client.request("OPTIONS", "/uploads").unwrap()
+    print(f"options status: {options.status}")
+    print("options version: " + options.header("Tus-Version"))
+    print("options max: " + options.header("Tus-Max-Size"))
+
+    created: HttpResponse = client.build("POST", "/uploads")
+        .header("Tus-Resumable", "1.0.0")
+        .header("Upload-Length", "5")
+        .header("Upload-Metadata", "filename aGVsbG8udHh0")
+        .send()
+        .unwrap()
+    location: str = created.header("Location")
+    print(f"create status: {created.status}")
+    print("location valid: " + str(location.startsWith("/uploads/") and len(location) == 45))
+
+    badMedia: HttpResponse = client.build("PATCH", location)
+        .header("Upload-Offset", "0")
+        .text("x", "text/plain")
+        .send()
+        .unwrap()
+    print(f"bad media status: {badMedia.status}")
+
+    emptyChunk: HttpResponse = client.build("PATCH", location)
+        .header("Tus-Resumable", "1.0.0")
+        .header("Upload-Offset", "0")
+        .header("Content-Type", "application/offset+octet-stream")
+        .send()
+        .unwrap()
+    print(f"empty chunk status: {emptyChunk.status}")
+    print("empty chunk offset: " + emptyChunk.header("Upload-Offset"))
+
+    first: HttpResponse = client.build("PATCH", location)
+        .header("Tus-Resumable", "1.0.0")
+        .header("Upload-Offset", "0")
+        .text("he", "application/offset+octet-stream")
+        .send()
+        .unwrap()
+    print(f"first chunk status: {first.status}")
+    print("first chunk offset: " + first.header("Upload-Offset"))
+
+    conflict: HttpResponse = client.build("PATCH", location)
+        .header("Upload-Offset", "0")
+        .text("x", "application/offset+octet-stream")
+        .send()
+        .unwrap()
+    print(f"conflict status: {conflict.status}")
+
+    finalChunk: HttpResponse = client.build("PATCH", location)
+        .header("Tus-Resumable", "1.0.0")
+        .header("Upload-Offset", "2")
+        .text("llo", "application/offset+octet-stream")
+        .send()
+        .unwrap()
+    print(f"final chunk status: {finalChunk.status}")
+    print("final chunk offset: " + finalChunk.header("Upload-Offset"))
+
+    inspected: HttpResponse = client.head(location).unwrap()
+    print(f"head status: {inspected.status}")
+    print("head length: " + inspected.header("Upload-Length"))
+    print("head offset: " + inspected.header("Upload-Offset"))
+    id: str = location[9:]
+    stored: str = str(Os.readFile(tmp + "/" + id).value)
+    print("stored content: " + stored)
+
+    collected: Result[int] = tusGc(tmp, 0)
+    print("gc result: " + str(collected.ok()))
+    print("gc removed: " + str(collected.unwrap()))
+    blobExists: bool = resultBool(Os.fileExists(tmp + "/" + id))
+    print("blob removed: " + str(not blobExists))
+    afterGc: HttpResponse = client.head(location).unwrap()
+    print(f"head after gc: {afterGc.status}")
+
+    server.close()
+    _ = Os.removeAll(tmp)
+}
