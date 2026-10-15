@@ -186,12 +186,12 @@ go! {
 }
 
 func _tusBaseHeaders(response: Response) {
-    response.setHeader("Tus-Resumable", "1.0.0")
-    response.setHeader("Cache-Control", "no-store")
-    response.setHeader("Access-Control-Allow-Origin", "*")
-    response.setHeader("Access-Control-Expose-Headers", "Upload-Offset, Location, Upload-Length, Tus-Resumable, Tus-Version, Tus-Max-Size, Tus-Extension, Tus-Checksum-Algorithm, Upload-Metadata, Upload-Concat")
-    response.setHeader("Access-Control-Allow-Methods", "POST, HEAD, PATCH, OPTIONS, DELETE")
-    response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Concat, Upload-Checksum, X-Requested-With")
+    _ = response.setHeader("Tus-Resumable", "1.0.0")
+    _ = response.setHeader("Cache-Control", "no-store")
+    _ = response.setHeader("Access-Control-Allow-Origin", "*")
+    _ = response.setHeader("Access-Control-Expose-Headers", "Upload-Offset, Location, Upload-Length, Tus-Resumable, Tus-Version, Tus-Max-Size, Tus-Extension, Tus-Checksum-Algorithm, Upload-Metadata, Upload-Concat")
+    _ = response.setHeader("Access-Control-Allow-Methods", "POST, HEAD, PATCH, OPTIONS, DELETE")
+    _ = response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Concat, Upload-Checksum, X-Requested-With")
 }
 
 func _tusFail(response: Response, failure: any) {
@@ -224,9 +224,9 @@ func _tusFail(response: Response, failure: any) {
             status = 400
         }
     }
-    response.setStatus(status)
-    response.setHeader("Content-Type", "text/plain")
-    response.text("tus: " + message)
+    _ = response.setStatus(status)
+    _ = response.setHeader("Content-Type", "text/plain")
+    _ = response.text("tus: " + message)
 }
 
 func _tusChecksum(header: str, chunk: str) -> Result[bool] {
@@ -496,13 +496,13 @@ func _tusDelete(storeDir: str, id: str) -> Result[bool] {
 
 func _tusOptions(_request: Request, response: Response, maxBytes: int) {
     _tusBaseHeaders(response)
-    response.setHeader("Tus-Version", "1.0.0")
-    response.setHeader("Tus-Extension", "creation,creation-with-upload,termination,concatenation,checksum")
-    response.setHeader("Tus-Checksum-Algorithm", "sha1,sha256,md5")
+    _ = response.setHeader("Tus-Version", "1.0.0")
+    _ = response.setHeader("Tus-Extension", "creation,creation-with-upload,termination,concatenation,checksum")
+    _ = response.setHeader("Tus-Checksum-Algorithm", "sha1,sha256,md5")
     if maxBytes > 0 {
-        response.setHeader("Tus-Max-Size", str(maxBytes))
+        _ = response.setHeader("Tus-Max-Size", str(maxBytes))
     }
-    response.setStatus(204)
+    _ = response.setStatus(204)
     response.sent = true
 }
 
@@ -532,11 +532,11 @@ func _tusPost(request: Request, response: Response, server: Server, mountPath: s
             _tusFail(response, persisted.error)
             return
         }
-        response.setHeader("Upload-Offset", str(persisted.unwrap()))
+        _ = response.setHeader("Upload-Offset", str(persisted.unwrap()))
     }
 
-    response.setHeader("Location", mountPath + "/" + id)
-    response.setStatus(201)
+    _ = response.setHeader("Location", mountPath + "/" + id)
+    _ = response.setStatus(201)
     response.sent = true
 }
 
@@ -548,8 +548,8 @@ func _tusHead(request: Request, response: Response, mountPath: str, storeDir: st
         return
     }
     headers: dict[str, str] = found.unwrap()
-    response.setHeaders(headers)
-    response.setStatus(200)
+    _ = response.setHeaders(headers)
+    _ = response.setStatus(200)
     response.sent = true
 }
 
@@ -569,8 +569,8 @@ func _tusPatch(request: Request, response: Response, server: Server, storeDir: s
         _tusFail(response, persisted.error)
         return
     }
-    response.setHeader("Upload-Offset", str(persisted.unwrap()))
-    response.setStatus(204)
+    _ = response.setHeader("Upload-Offset", str(persisted.unwrap()))
+    _ = response.setStatus(204)
     response.sent = true
 }
 
@@ -581,7 +581,7 @@ func _tusDeleteHandler(request: Request, response: Response, storeDir: str) {
         _tusFail(response, removed.error)
         return
     }
-    response.setStatus(204)
+    _ = response.setStatus(204)
     response.sent = true
 }
 

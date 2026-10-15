@@ -1,0 +1,25 @@
+# Regression: the package no longer declares a root ``tag()`` (name and
+# version live in lamlib.toml), so an application or another package may
+# declare its own top-level ``tag`` and still link with this package.
+#
+# expect: tag=application
+# expect: mounted=true
+# expect: gc=0
+
+from lamos import Os
+from @lam/vulture import Server
+from @lam/vulture/tus-plugin import tusUploads, tusGc
+
+func tag() -> str {
+    return "application"
+}
+
+func main() {
+    print("tag=" + tag())
+    store: str = Os.tempDir() + "/lam-vulture-tus-no-root-tag"
+    _ = Os.removeAll(store)
+    srv: Server = Server()
+    print(f"mounted={tusUploads(srv, '/files', store, 1024).ok()}")
+    print(f"gc={tusGc(store, 1).unwrap()}")
+    _ = Os.removeAll(store)
+}

@@ -153,14 +153,6 @@ removed: int = tusGc("./var/uploads", 72).unwrap()
 print(f"removed {removed} uploads older than three days")
 ```
 
-### `tag`
-
-```lammergeier
-from @lam/vulture/tus-plugin import tag
-
-print(tag())  # @lam/vulture/tus-plugin@2.0.0
-```
-
 ## Configuration examples
 
 ### Unlimited development endpoint
