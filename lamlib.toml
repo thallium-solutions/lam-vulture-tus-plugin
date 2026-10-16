@@ -1,6 +1,6 @@
 [library]
 name = "@lam/vulture/tus-plugin"
-version = "3.0.0"
+version = "3.0.1"
 description = "tus 1.0 resumable-upload plugin for @lam/vulture"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]
@@ -11,7 +11,7 @@ homepage = "https://github.com/thallium-solutions/lam-vulture-tus-plugin"
 lamc = "^1.18"
 
 [dependencies]
-"@lam/vulture" = { git = "https://github.com/thallium-solutions/lam-vulture.git", ref = "v2.0.0" }
+"@lam/vulture" = { git = "https://github.com/thallium-solutions/lam-vulture.git", ref = "2.0.1" }
 
 [go-deps]
 "github.com/google/uuid" = "v1.6.0"

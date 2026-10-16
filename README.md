@@ -33,25 +33,25 @@ Tus-Checksum-Algorithm: sha1,sha256,md5
 
 - Lammergeier compiler (`lamc`) 1.18.0 or newer in the compatible `1.x` line
   (`^1.18`).
-- `@lam/vulture` v2.0.0. The release Git ref is pinned in `lamlib.toml`.
+- `@lam/vulture` 2.0.1. The release Git ref is pinned in `lamlib.toml`.
 - `github.com/google/uuid` v1.6.0. This matches the version used by the former
   central standard-library module.
 
 ## Installation
 
-Install the v2.0.0 Git release directly:
+Install the 3.0.1 Git release directly:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-vulture-tus-plugin.git@v2.0.0
+lamc install https://github.com/thallium-solutions/lam-vulture-tus-plugin.git@3.0.1
 ```
 
 After registry publication, install by scoped package name:
 
 ```bash
-lamc install @lam/vulture/tus-plugin@2.0.0
+lamc install @lam/vulture/tus-plugin@3.0.1
 ```
 
-The package manifest resolves `@lam/vulture` from its pinned v2.0.0 Git ref.
+The package manifest resolves `@lam/vulture` from its pinned 2.0.1 Git ref.
 Applications import the plugin and the core server separately:
 
 ```lammergeier
