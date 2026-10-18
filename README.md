@@ -31,9 +31,9 @@ Tus-Checksum-Algorithm: sha1,sha256,md5
 
 ## Requirements
 
-- Lammergeier compiler (`lamc`) 1.18.0 or newer in the compatible `1.x` line
-  (`^1.18`).
-- `@lam/vulture` 2.0.1. The release Git ref is pinned in `lamlib.toml`.
+- Lammergeier compiler (`lamc`) 1.18.0 or newer, including 2.x
+  (`>=1.18, <3`).
+- `@lam/vulture` 2.0.2. The release Git ref is pinned in `lamlib.toml`.
 - `github.com/google/uuid` v1.6.0. This matches the version used by the former
   central standard-library module.
 
