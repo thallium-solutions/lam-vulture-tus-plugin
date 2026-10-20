@@ -2,6 +2,13 @@
 
 All notable changes to `@lam/vulture/tus-plugin` are documented here.
 
+## [3.0.3] - 2026-10-20
+
+### Changed
+
+- Compatible with `lamc` 3.x: `compatibility.lamc = ">=1.18, <4"` (test runner too).
+- Pins `@lam/vulture` 2.0.3.
+
 ## [3.0.2] - 2026-10-18
 
 ### Changed
