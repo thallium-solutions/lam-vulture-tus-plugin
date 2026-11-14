@@ -2,6 +2,31 @@
 
 All notable changes to `@lam/vulture/tus-plugin` are documented here.
 
+## [3.0.5] - 2026-11-14
+
+### Fixed
+
+- The completion callback documented in the README
+  (`server.ctx["__tusComplete"] = lambda upload: ...`) is called. Only a
+  callback whose Go type was exactly `func(map[string]interface{})` (a typed
+  Lam lambda returning nothing) was recognised; the README's untyped lambda
+  was silently never called. Typed and untyped lambdas, with or without a
+  result, are accepted now.
+- A zero-length upload (`Upload-Length: 0`) is complete when it is created
+  and its completion callback runs; it stayed incomplete forever (no PATCH
+  can complete it), so the callback never ran.
+
+### Tests
+
+- `tests/test_tus_binary_concurrent_completion.lam` (real listener): every
+  byte value and a UTF-8 character split across two PATCH requests stored
+  byte-exact; non-ASCII base64 metadata in the completion payload; typed and
+  untyped completion callbacks (both fixes); creation-with-upload; zero-length
+  uploads; `Tus-Max-Size`; a race of two PATCH requests at the same offset
+  (one 204, one 409); 10 uploads sent concurrently from async tasks by an
+  `Uploader` class with `?`, `do/catch` and comprehensions; a missing upload.
+  Clean under `--race`.
+
 ## [3.0.4] - 2026-11-03
 
 ### Changed

@@ -172,16 +172,33 @@ go! {
         return payload
     }
 
+    // lamTusNotifyComplete calls the completion callback. A typed Lam lambda
+    // (``lambda (upload: dict[str, any]) -> None``) and an untyped one
+    // (``lambda upload: ...``, as the README shows) have different Go types;
+    // both are accepted.
     func lamTusNotifyComplete(srv *Server, storeDir string, info *lamTusInfo) {
-        if cb, ok := srv.Ctx["__tusComplete"]; ok {
-            if fn, ok := cb.(func(map[string]interface{})); ok {
-                payload := lamTusCompletionPayload(storeDir, info)
-                func() {
-                    defer func() { _ = recover() }()
-                    fn(payload)
-                }()
-            }
+        cb, ok := srv.Ctx["__tusComplete"]
+        if !ok || cb == nil {
+            return
         }
+        var call func(map[string]interface{})
+        switch fn := cb.(type) {
+        case func(map[string]interface{}):
+            call = fn
+        case func(map[string]interface{}) interface{}:
+            call = func(p map[string]interface{}) { _ = fn(p) }
+        case func(interface{}):
+            call = func(p map[string]interface{}) { fn(p) }
+        case func(interface{}) interface{}:
+            call = func(p map[string]interface{}) { _ = fn(p) }
+        default:
+            return
+        }
+        payload := lamTusCompletionPayload(storeDir, info)
+        func() {
+            defer func() { _ = recover() }()
+            call(payload)
+        }()
     }
 }
 
@@ -262,6 +279,11 @@ func _tusCreate(storeDir: str, lengthHeader: str, metadataHeader: str, concatHea
         }
         if concatHeader == "partial" {
             info.Concat = "partial"
+        }
+        // A zero-length upload is complete as soon as it exists.
+        if length == 0 {
+            info.Complete = true
+            info.FinishedAt = time.Now().UTC()
         }
         if err := lamTusWriteInfo(storeDir, info); err != nil {
             return lamTusError("TusPersistenceError", "cannot persist info: "+err.Error())
@@ -521,6 +543,17 @@ func _tusPost(request: Request, response: Response, server: Server, mountPath: s
     }
 
     id: str = created.unwrap()
+    if not concatHeader.startsWith("final") {
+        # A zero-length upload is complete on creation: notify now.
+        lengthHeader: str = request.header("Upload-Length")
+        go! {
+            if length, err := strconv.ParseInt(lengthHeader, 10, 64); err == nil && length == 0 {
+                if info, err := lamTusReadInfo(storeDir, id); err == nil && info.Complete {
+                    lamTusNotifyComplete(server, storeDir, info)
+                }
+            }
+        }
+    }
     if not concatHeader.startsWith("final") and request.header("Content-Type").startsWith("application/offset+octet-stream") and len(request.body) > 0 {
         checksum: Result[bool] = _tusChecksum(request.header("Upload-Checksum"), request.body)
         if not checksum.ok() {

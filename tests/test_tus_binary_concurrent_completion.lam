@@ -1,0 +1,210 @@
+# tus over a real listener: binary chunks (every byte value, a UTF-8
+# character split across two PATCH requests), non-ASCII metadata, the
+# completion callback (`server.ctx["__tusComplete"]`, typed and untyped
+# lambdas as in the README), creation-with-upload, zero-length uploads,
+# size limits, a race of two PATCH requests at the same offset, and 10
+# uploads sent concurrently from async tasks by an `Uploader` class, checked
+# with `?`, `do/catch` and comprehensions.
+#
+# expect: listening: true
+# expect: binary upload: 204 offset=258 stored=258 byte-exact=true
+# expect: completion: 1 calls length=258 filename=Zoë 🦅.bin type=application/octet-stream path=true
+# expect: creation-with-upload: 201 offset=5 complete=true
+# expect: zero length: 201 offset=0 length=0 completed=true
+# expect: too large: 413
+# expect: same-offset race: [204 409]
+# expect: concurrent uploads: 10/10 completions=14
+# expect: untyped callback: 1
+# expect: missing upload: 404
+# expect: ok
+
+from @lam/vulture import Server
+from @lam/vulture/tus-plugin import tusUploads
+from lambase64 import Base64
+from lamconcurrency import Mutex
+from lamerrors import Result, Error
+from lamhttp import HttpClient, HttpResponse
+from lamos import Os
+from lamtime import Time
+
+go! {
+    func tusAllBytes() string {
+        raw := make([]byte, 256)
+        for i := range raw {
+            raw[i] = byte(i)
+        }
+        return string(raw)
+    }
+
+}
+
+func b64(text: str) -> str {
+    return Base64.encode(text)
+}
+
+class Completions {
+    func init(self) {
+        self.lock: Mutex = Mutex()
+        self.uploads: list[dict[str, any]] = []
+    }
+
+    func record(self, upload: dict[str, any]) {
+        self.lock.lock()
+        self.uploads.append(upload)
+        self.lock.unlock()
+    }
+
+    func count(self) -> int {
+        self.lock.lock()
+        defer self.lock.unlock()
+        return len(self.uploads)
+    }
+}
+
+class UntypedProbe {
+    calls: int = 0
+
+    func record(self, upload: any) -> int {
+        _ = upload
+        self.calls += 1
+        return self.calls
+    }
+}
+
+class Uploader {
+    func init(self, client: HttpClient) {
+        self.client: HttpClient = client
+    }
+
+    func create(self, length: int, metadata: str = "") -> Result[str] {
+        created: HttpResponse = self.client.build("POST", "/uploads").header("Tus-Resumable", "1.0.0").header("Upload-Length", str(length)).header("Upload-Metadata", metadata).send()?
+        if created.status != 201 {
+            return Result.Err(Error("TusCreateFailed", f"status {created.status}: {created.body}"))
+        }
+        return Result.Ok(created.header("Location"))
+    }
+
+    func patch(self, location: str, offset: int, chunk: str) -> Result[int] {
+        sent: HttpResponse = self.client.build("PATCH", location).header("Tus-Resumable", "1.0.0").header("Upload-Offset", str(offset)).text(chunk, "application/offset+octet-stream").send()?
+        if sent.status != 204 {
+            return Result.Err(Error("TusPatchFailed", f"status {sent.status}"))
+        }
+        return Result.Ok(int(sent.header("Upload-Offset")))
+    }
+
+    func upload(self, body: str, chunkBytes: int, metadata: str = "") -> Result[str] {
+        location: str = self.create(len(bytes(body)), metadata)?
+        offset: int = 0
+        raw: bytes = bytes(body)
+        while offset < len(raw) {
+            end: int = offset + chunkBytes if offset + chunkBytes < len(raw) else len(raw)
+            part: str = ""
+            slice: bytes = raw[offset:end]
+            go! {
+                part = string(slice)
+            }
+            offset = self.patch(location, offset, part)?
+        }
+        return Result.Ok(location)
+    }
+}
+
+async func uploadTask(uploader: Uploader, i: int) -> Result[str] {
+    return uploader.upload(f"file {i}: Grüße 東京 🦅 " * (i + 1), 7, "filename " + b64(f"f-{i}.txt"))
+}
+
+async func patchTask(client: HttpClient, location: str, chunk: str) -> int {
+    r: Result[HttpResponse] = client.build("PATCH", location).header("Tus-Resumable", "1.0.0").header("Upload-Offset", "0").text(chunk, "application/offset+octet-stream").send()
+    return r.unwrap().status if r.ok() else -1
+}
+
+func main() {
+    store: str = Os.tempDir() + "/lam-tus-binary-" + str(Time.nowUnixNano())
+    completions: Completions = Completions()
+    server: Server = Server()
+    server.ctx["__tusComplete"] = lambda (upload: dict[str, any]) -> None {
+        completions.record(upload)
+    }
+    _ = tusUploads(server, "/uploads", store, 4096).unwrap()
+    print(f"listening: {server.listenBackground(0).ok()}")
+    client: HttpClient = HttpClient("http://" + server.boundAddr, 5000)
+    uploader: Uploader = Uploader(client)
+
+    # Every byte value, then "é" (c3 a9) split across two chunks.
+    raw: str = ""
+    go! {
+        raw = tusAllBytes()
+    }
+    body: str = raw + "é"
+    meta: str = "filename " + b64("Zoë 🦅.bin") + ",filetype " + b64("application/octet-stream")
+    location: str = uploader.create(258, meta).unwrap()
+    _ = uploader.patch(location, 0, raw).unwrap()
+    firstHalf: str = ""
+    secondHalf: str = ""
+    go! {
+        firstHalf = "\xc3"
+        secondHalf = "\xa9"
+    }
+    _ = uploader.patch(location, 256, firstHalf).unwrap()
+    last: HttpResponse = client.build("PATCH", location).header("Tus-Resumable", "1.0.0").header("Upload-Offset", "257").text(secondHalf, "application/offset+octet-stream").send().unwrap()
+    id: str = location.split("/")[-1]
+    stored: str = Os.readFile(store + "/" + id).unwrap()
+    print(f"binary upload: {last.status} offset={last.header('Upload-Offset')} stored={len(bytes(stored))} byte-exact={stored == body}")
+    first: dict[str, any] = completions.uploads[0]
+    metadata: dict[str, str] = first["metadata"]
+    print(f"completion: {completions.count()} calls length={first['length']} filename={metadata['filename']} type={metadata['filetype']} path={str(first['path']).endsWith(id)}")
+
+    withBody: HttpResponse = client.build("POST", "/uploads").header("Tus-Resumable", "1.0.0").header("Upload-Length", "5").text("hello", "application/offset+octet-stream").send().unwrap()
+    print(f"creation-with-upload: {withBody.status} offset={withBody.header('Upload-Offset')} complete={completions.count() == 2}")
+
+    empty: HttpResponse = client.build("POST", "/uploads").header("Tus-Resumable", "1.0.0").header("Upload-Length", "0").send().unwrap()
+    emptyHead: HttpResponse = client.head(empty.header("Location")).unwrap()
+    print(f"zero length: {empty.status} offset={emptyHead.header('Upload-Offset')} length={emptyHead.header('Upload-Length')} completed={completions.count() == 3}")
+
+    tooLarge: HttpResponse = client.build("POST", "/uploads").header("Tus-Resumable", "1.0.0").header("Upload-Length", "4097").send().unwrap()
+    print(f"too large: {tooLarge.status}")
+
+    raced: str = uploader.create(4).unwrap()
+    racers = [patchTask(client, raced, "abcd"), patchTask(client, raced, "wxyz")]
+    statuses: list[int] = []
+    for task in racers {
+        statuses.append(await task)
+    }
+    print(f"same-offset race: {sorted(statuses)}")
+
+    pending = [uploadTask(uploader, i) for i in range(10)]
+    done: int = 0
+    do {
+        for task in pending {
+            r: Result[str] = await task
+            uploaded: str = r?
+            text: str = Os.readFile(store + "/" + uploaded.split("/")[-1])?
+            if text.startsWith("file ") and text.endsWith("🦅 ") {
+                done++
+            }
+        }
+    } catch err {
+        print(f"upload failed: {err}")
+    }
+    print(f"concurrent uploads: {done}/10 completions={completions.count()}")
+
+    untyped: Server = Server()
+    probe: UntypedProbe = UntypedProbe()
+    # The README's form: an untyped lambda. (Its body calls a method:
+    # `lambda upload: calls.append(...)` does not build with lamc 4.14.0,
+    # /tmp/lam-pkg-compiler-bugs/lambda_append_body.lam.)
+    untyped.ctx["__tusComplete"] = lambda upload: probe.record(upload)
+    _ = tusUploads(untyped, "/uploads", store + "-untyped", 0).unwrap()
+    _ = untyped.listenBackground(0).unwrap()
+    plain: Uploader = Uploader(HttpClient("http://" + untyped.boundAddr, 5000))
+    _ = plain.upload("abc", 3).unwrap()
+    print(f"untyped callback: {probe.calls}")
+
+    missing: HttpResponse = client.build("PATCH", "/uploads/00000000-0000-0000-0000-000000000000").header("Tus-Resumable", "1.0.0").header("Upload-Offset", "0").text("x", "application/offset+octet-stream").send().unwrap()
+    print(f"missing upload: {missing.status}")
+    server.close()
+    untyped.close()
+    _ = Os.removeAll(store)
+    _ = Os.removeAll(store + "-untyped")
+    print("ok")
+}

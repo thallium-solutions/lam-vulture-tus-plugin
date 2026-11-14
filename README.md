@@ -41,13 +41,13 @@ Tus-Checksum-Algorithm: sha1,sha256,md5
 Install the 3.0.1 Git release directly:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-vulture-tus-plugin.git@3.0.1
+lamc install https://github.com/thallium-solutions/lam-vulture-tus-plugin.git@3.0.5
 ```
 
 After registry publication, install by scoped package name:
 
 ```bash
-lamc install @lam/vulture/tus-plugin@3.0.1
+lamc install @lam/vulture/tus-plugin@3.0.5
 ```
 
 The package manifest resolves `@lam/vulture` from its pinned 2.0.1 Git ref.
@@ -187,6 +187,10 @@ server: Server = Server()
 server.ctx["__tusComplete"] = lambda upload: print(f"ready: {upload['path']}")
 _ = tusUploads(server, "/uploads", "./var/uploads", 200 * 1024 * 1024).unwrap()
 ```
+
+The callback may be an untyped lambda (above) or a typed one
+(`lambda (upload: dict[str, any]) -> None { ... }`). A zero-length upload is
+complete, and its callback runs, as soon as it is created.
 
 Completion callbacks run after metadata is marked complete. Keep callbacks
 short; enqueue expensive antivirus scans, transcoding, or object-store copies
